@@ -33,6 +33,20 @@ using jbc::ir::InsnId;
 
 namespace {
 
+// ==== SCAN ====================================================================
+// 找出"这个调用点是不是一个可静态求值的字符串解密站点"。纯读。
+//
+//   粗找  区间回溯窗口 kRegionWindow 内找 invokestatic 锚点        可钉形状
+//   细找  区间栈自足 + 解密器纯 + 求值器跑出合法明文
+//         判据等级 **S2**（结构事实）——跨构建稳定，跨 DashO 版本需复核
+//   拒绝  解密器不纯 / 在 jar 外 / 求值失败 / 明文非法 / 局部变量外泄
+//
+// 关键设计：**不依赖解密器的名字、签名或所在类**，所以换一个加密 seed 或换一个
+// 运行时类名都不影响本段——判据钉的是"调用点可静态求值"这个结构事实。
+//
+// 求值器的多 seed 校验（kSeeds）是拒绝面的一部分：Random 种子不同而结果相同，
+// 才认定该站点与随机源无关；否则拒绝，因为它依赖运行时状态。
+
 /// 区间回溯窗口：DashO 调用点（密钥算术 + 谓词 + 双支 + 解密链）实测不超过
 /// 40 条指令；留一倍余量，避免在超长方法体上做无界回溯。
 constexpr ca::usize kRegionWindow = 80;
@@ -428,6 +442,12 @@ ca::i32 localSlotOf(const Insn& in)
 
 /// 单方法内的改写器：持会话与 CodeUnit，负责区间校验、求值与替换。
 ///
+/// 约定允许的**例外形态**（CONVENTION.md §5.3）：`.cpp` 内的自由 struct/class 只是
+/// 局部变量的组织方式，不是接口——它不进头文件、不可继承、adapter 看不见它。
+/// 判据很简单：出现在 `.hpp` 里就是接口，出现在 `.cpp` 里就是局部变量。
+///
+/// 本类同时装着 SCAN 方法与 REWRITE 方法，分区标记照常打在各方法上方。
+///
 /// 两种改写策略，按方法是否带异常表选择：
 ///   - **整段折叠**（无异常表）：区间替换为一条 ldc 明文，死支诱饵一并消失。
 ///     指令增删 → 既有帧目标悬垂 → 写回时按新布局再生 StackMapTable。
@@ -749,6 +769,9 @@ private:
         return true;
     }
 
+    // ==== SCAN（方法内）=======================================================
+    // isAnchor / noteCallee / structurallyOk / containsStringLdc / localsNotEscaping
+    // / evaluate / anchorDepthUniform —— 全部纯读。
     bool tryFoldAt(ca::usize anchor)
     {
         const ca::usize lo = anchor > kRegionWindow ? anchor - kRegionWindow : 0;
@@ -802,6 +825,14 @@ private:
         }
         return false;
     }
+    // ==== REWRITE ==============================================================
+    // 只消费 tryFoldAt 已经确认的区间与求值结果，不回头重新找站点。
+    //
+    //   rewriteRegion   无异常表 → 整段折叠成一条 ldc（指令数变 → 帧必须重算）
+    //   rewriteInPlace  有异常表 → 原地替换，指令数与栈形不变（原帧逐条仍有效）
+    //
+    // 两条策略按"摘完帧还能不能重算"这个**语义事实**选择，与版本无关。
+    //
     /// 整段折叠：区间内除头指令外全部擦除，头指令改写为 `ldc 明文`。
     /// 前置条件由 tryFoldAt 保证（无异常表、死支可擦、局部不外泄）。
     bool rewriteRegion(ca::usize start, ca::usize end, const std::u16string& plain)
@@ -1020,6 +1051,16 @@ private:
 
 }   // namespace
 
+// ==== PROOF ===================================================================
+// 判定 + 回滚。
+//
+//   类级门  set.commit —— 帧再生 + 校验器 + 类数不增，失败回滚该类
+//   死类门  只删"零引用 + 全部方法折叠过 + 自己就是解密器形态"的类
+//   包级门  整包不发布
+//
+// 帧是这里的核心：整段折叠改了指令数 → 既有帧目标悬垂 → 交给 commit 按新布局
+// 再生；原地改写不动指令数 → 原帧（含 verifier 要求的保守 handler 帧）逐条有效。
+// 两条策略的差别全在"能不能安全地重算帧"。
 mjbase::spi::PreservedAnalyses DashoStringDecryptPass::run(
     mjbase::model::ResourceContainer& container, mjbase::spi::GlobalAnalysisManager& am)
 {

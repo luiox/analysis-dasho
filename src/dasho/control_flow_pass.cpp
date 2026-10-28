@@ -33,6 +33,19 @@ using jbc::ir::LabelId;
 
 namespace {
 
+// ==== SCAN ====================================================================
+// 判定"这个类是不是 DashO 注入的假异常类"、"这条指令有没有引用它"。纯读。
+//
+//   粗找  catch_type 指向的类集合                      可钉结构，很便宜
+//   细找  生成类指纹 = classfile 45.3 + 0 字段 0 方法 + 直挂 RuntimeException
+//         判据等级 **S1**（语义后果）——所以本残留的判据一次成型，没改过
+//
+// 为什么是 S1：注入 handler 的 catch_type 必须指向一个真的 Throwable 子类型，
+// 否则 class 校验不过——这是混淆器为了产物能跑**非如此不可**的事，它改不掉。
+// 而 `45.3` 这个常量本身是 S3（DashO 的实现选择），属于版本敏感数据，未来应
+// 落到 knowledge/ 并由 probeEra() 供给。
+//
+// ── 生成类指纹 ──
 /// DashO 生成类的统一 classfile 版本：**45.3**（major 45 / minor 3）。
 ///
 /// 打包口径与 `ClassUnit::version` 一致 = (major<<16)|minor。注意 classfile
@@ -53,7 +66,7 @@ bool isFakeExceptionClass(const LoadedClass& lc)
     return u.symbols().str(u.superClass) == kRuntimeException;
 }
 
-// ── CFG：共用底座见 cfg.hpp；本 pass 只额外需要"含异常边"的可达性 ──
+// ── CFG：共用底座收口在 cfg.hpp；本残留只额外需要"含异常边"的可达性 ──
 
 /// 从方法入口（下标 0）求可达指令集，异常边按 `cu.exc` 当前内容算。
 ///
@@ -224,6 +237,14 @@ mjbase::spi::PreservedAnalyses DashoControlFlowPass::run(
             }
             if (dropped.empty()) continue;
 
+            // ==== REWRITE ======================================================
+            // 以上步骤 1-2 属于 SCAN（圈定 + 分流，不动任何东西）；从这里开始改。
+            // 只消费上面算出的 survivors/dropped，不回头重新找站点。
+            //
+            // 改写策略是**二选一的语义决策**，与版本无关，所以本段禁止版本分支：
+            //   异常表摘空 → 结构改写（删不可达 + tidy goto，帧可重算）
+            //   还剩真 handler → 保布局（只换表项，不增删指令，原帧逐条仍有效）
+            //
             // ── 3. 回收只被摘除项引用的边界标签 ──
             // 异常表标签是 Boundary 角色，会保护锚点；不先销毁，后面删 handler
             // 体会被 eraseBatch 以 StillUsed 整批拒绝。存活项还在用的标签必须
@@ -287,6 +308,15 @@ mjbase::spi::PreservedAnalyses DashoControlFlowPass::run(
 
     if (droppedEntries == 0) return mjbase::spi::PreservedAnalyses::all();
 
+    // ==== PROOF =================================================================
+    // 判定 + 回滚。
+    //
+    //   类级门  set.commit —— 帧再生 + 校验器 + 类数不增，写回失败的类留在原始字节上
+    //   死类门  只有"全部写回成功"且不在 keepAlive 里才删假异常类
+    //   包级门  整包不发布
+    //
+    // 回滚粒度是**类**：任一类写回失败，整包的类删除动作都不执行（fail-closed）。
+    //
     // ── 5. 写回 ──
     ca::usize dirtyClasses = 0;
     for (const LoadedClass& lc : set.classes()) {

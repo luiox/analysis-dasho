@@ -21,6 +21,16 @@ using ca::core::Result;
 
 namespace {
 
+// ==== SCAN ====================================================================
+// 本残留是约定的**边界用例**：不做任何判据，识别完全由旁证驱动。
+//
+//   证据分类  【旁证】构建时产出的 mapfile——混淆器自己写的原名对照表
+//   拒绝      未提供 mapfile / 目标 URI 冲突 / 规划为空 / 容器零变化
+//
+// 按 ScanResult 契约（CONVENTION.md §4），`Site.why` **允许为空**：改名不可逆推，
+// 没有"结构证据"可言，唯一可信来源就是混淆器自己留下的对照表。拿不到对照表就
+// 整体拒绝，绝不猜——这是四类证据里"旁证"那一类的典型样本。
+
 std::vector<std::string> collectUris(const mjbase::model::ResourceContainer& container)
 {
     std::vector<std::string> uris;
@@ -43,6 +53,9 @@ DashoRenamePass::run(mjbase::model::ResourceContainer& container,
         return mjbase::spi::PreservedAnalyses::all();
     }
 
+    // ==== SCAN（续）============================================================
+    // 步骤 1-2 全是识别与规划：预检 URI 冲突、反演成重映射计划。不动字节码。
+    //
     // ── 1. 目标 URI 冲突预检 ──
     // mapfile 与 jar 不配套时（拿错构建的 map、jar 已被别的工具改过），两条
     // 类规则可能抢同一个 `原名.class`。容器是 map，后写覆盖先写——不预检就是
@@ -64,10 +77,21 @@ DashoRenamePass::run(mjbase::model::ResourceContainer& container,
         return mjbase::spi::PreservedAnalyses::all();
     }
 
+    // ==== REWRITE ==============================================================
+    // 只消费上面反演出的 plan，不回头重新找站点。
+    //
     // ── 3. 应用 ──
     // 全开改写面：漏一面就留悬垂引用（见头文件"为什么这些面必须一起开"）。
     const auto result = mjbase::asm_remapper::applyResourceRemapPlan(
         container, plan, mjbase::asm_remapper::RemapPolicy::all());
+
+    // ==== PROOF ================================================================
+    // 判定。本残留的门是**失败即拒绝**，没有"修一下让它过"的余地：
+    //   applyResourceRemapPlan 出错 → 容器保持未完成状态（PreservedAnalyses::none）
+    //   计划非空但容器零变化       → mapfile 与 jar 不配套，显式告警
+    //
+    // 改名是全有或全无，`applyResourceRemapPlan` 在容器层是原子的，所以回滚粒度
+    // 天然是【整包】而不是【类】——这正是"回滚粒度"由残留性质决定、而非全局统一。
     if (result.is_err()) {
         CA_LOG_ERROR("[dasho.Rename] 改写失败（{}）：容器保持未完成状态，请勿采用本输出",
                      mjbase::asm_remapper::to_string(result.unwrap_err()));

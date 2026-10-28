@@ -4,15 +4,27 @@
 
 DashO（PreEmptive Protection）混淆家族的 deobf 插件仓：mjbase pass-pack 静态链接 + 独立 CLI。输入混淆 jar，输出还原 jar。无宿主进程、无动态库边界，ABI 面不存在；pack 与 CLI 同源构建，跨仓混装产物由 mjbase 同源门拒绝。
 
+**代码怎么组织见 [CONVENTION.md](CONVENTION.md)**：组织单位是「一种残留」，每种残留 = 一份会变的家族知识 + 三段恒定的动作 `scan / rewrite / proof`；跨残留复用只允许发生在三个工具箱里；对接 pipeline 只是一张数据表（`pass` 这个词只允许出现在 adapter 里）。
+
+约定的五条禁止句是**可执行的**：
+
+```powershell
+pwsh -File tools/check-convention.ps1   # FAIL(真违规) / TODO(未迁移) / OK，退出码只看 FAIL
+```
+
 ## Pass 一览
 
-| Pass | 作用 | 判据 |
-|---|---|---|
-| `dasho.StringDecrypt` | 把字符串加密调用点折叠成明文 `ldc` | 调用点可静态求值(纯方法 + 常量区间),**不依赖解密器名字/签名/所在类** |
-| `dasho.ControlFlow` | 摘除 `controlflow tryCatch` 注入的异常表项与假异常类 | `catch_type` 指向**生成类**(classfile 45.3 + 0 成员 + `RuntimeException`),**不依赖注入形状** |
-| `dasho.Checks` | 摘除运行时检查注入段(debug/emulator/hook/root/tamper/shelfLife) | **两层**:模板形状(反射三连 + `(seed*k)%seed` 谓词 + 响应)∧ 区间结构(hammock 单入口单出口) |
-| `dasho.Cleanup` | 清除控制流填充:空转块、不可达死块、goto 接力、溢写对 | 窗口级**栈自足** + 逐指令**活跃性**(写下的槽在出口已死) |
-| `dasho.Rename` | 按 mapfile 把混淆名还原成原名(类/成员/描述符/签名/反射常量/资源路径) | **不做判据**——改名不可逆推,只认构建时产出的 mapfile |
+| Pass | 作用 | 判据 | 等级 |
+|---|---|---|---|
+| `dasho.StringDecrypt` | 把字符串加密调用点折叠成明文 `ldc` | 调用点可静态求值(纯方法 + 常量区间),**不依赖解密器名字/签名/所在类** | S2 |
+| `dasho.ControlFlow` | 摘除 `controlflow tryCatch` 注入的异常表项与假异常类 | `catch_type` 指向**生成类**(classfile 45.3 + 0 成员 + `RuntimeException`),**不依赖注入形状** | S1 |
+| `dasho.Checks` | 摘除运行时检查注入段(debug/emulator/hook/root/tamper/shelfLife) | **两层**:模板形状(反射三连 + `(seed*k)%seed` 谓词 + 响应)∧ 区间结构(hammock 单入口单出口) | S3 |
+| `dasho.Cleanup` | 清除控制流填充:空转块、不可达死块、goto 接力、溢写对 | 窗口级**栈自足** + 逐指令**活跃性**(写下的槽在出口已死) | S2 |
+| `dasho.Rename` | 按 mapfile 把混淆名还原成原名(类/成员/描述符/签名/反射常量/资源路径) | **不做判据**——改名不可逆推,只认构建时产出的 mapfile | —(旁证) |
+
+**等级**见 [CONVENTION.md](CONVENTION.md) §6：S1 语义后果(跨版本几乎不用改)、S2 结构事实(跨版本需复核)、S3
+实现选择(版本敏感,`Era` 分支唯一合法落点)。依据就在本页——`dasho.Checks` 的判据改了三轮、
+`dasho.ControlFlow` 一次成型,差别不在实现水平,在钉的东西不一样。
 
 ### `dasho.StringDecrypt`
 

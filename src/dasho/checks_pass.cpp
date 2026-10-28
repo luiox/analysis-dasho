@@ -42,6 +42,18 @@ constexpr ca::usize kMaxInsnsForRegion = 8192;
 /// 留足余量；超过即认为判据出了意外，停下来）。
 constexpr ca::usize kMaxRegionsPerMethod = 8;
 
+// ==== SCAN ====================================================================
+// 识别 dasho.Checks 注入的运行时检查段。两层判据，缺一不可。
+//
+//   粗找  引用解析 + 区间试探（hammock 单入口单出口）        可钉形状，便宜
+//   细找  模板形状（反射三连 + `(seed*k)%seed` 谓词 + 响应）
+//         判据等级 **S3**（实现选择）——所以本仓判据改过三轮
+//   拒绝  缺模板 / 有噪声无响应 / 区间结构不成立 / 区间超限
+//
+// 第二层钉的是 S3，是 `Era` 分支唯一合法落点：模板形状是 DashO 的**实现选择**，
+// 不是它非如此不可的语义后果。版本一变就该改这一层，而不是把版本号塞进
+// rewrite 或 proof。
+//
 // ── 引用解析 ──
 
 struct MemberRef
@@ -327,6 +339,15 @@ bool findRegion(jbc::ir::ClassSession& session, const CodeUnit& cu, const Graph&
     return false;
 }
 
+// ==== REWRITE =================================================================
+// 只消费 SCAN 段给出的 Region，不回头重新找站点（CONVENTION.md §3.2 第 4 条）。
+//
+//   stripOne  **先摘异常表、再删指令** —— 顺序不可换，见函数注释
+//
+// 改写策略选的是"结构剥离"（整段删除），与 control_flow 的"保布局"相对。能不能
+// 这么做取决于摘完之后帧还能不能重算——那是语义事实，与版本无关，所以本段禁止
+// 出现任何版本分支。
+//
 // ── 剥离 ──
 
 /// 把 [f, X) 整段删掉，并摘掉整条落在区间内的异常表项。
@@ -401,6 +422,10 @@ bool stripOne(CodeUnit& cu, const Region& r)
     return true;
 }
 
+// ==== SCAN（次级残留：死类候选）==============================================
+// checkRuntimeFacade 是注入进来的工具类；上面的检查段被摘掉之后它就没人引用了。
+// 判据等级 **S3**：钉的是命名前缀 + 空类形状，属于实现选择，跨版本必须复核。
+//
 // ── 死类清扫的候选 ──
 
 /// 检查运行时门面形态：`Bootstrap` 那一类。
@@ -439,6 +464,14 @@ std::unordered_set<std::string> collectCheckRuntimeFacades(ClassSet& set)
 
 }   // namespace
 
+// ==== PROOF ===================================================================
+// 判定 + 回滚。run() 只做编排。
+//
+//   类级门  ClassSet::commit —— 帧再生 + 校验器 + 类数不增，失败回滚该类
+//   死类门  只删"零引用且自己就是 facade"的类；有活引用就留着（fail-closed）
+//   包级门  整包不发布
+//
+// 回滚粒度是**类**。禁止"修一下让它过"。
 mjbase::spi::PreservedAnalyses DashoChecksPass::run(mjbase::model::ResourceContainer& container,
                                                     mjbase::spi::GlobalAnalysisManager& am)
 {

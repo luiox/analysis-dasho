@@ -33,6 +33,16 @@ namespace {
 /// 只是可能留着下一轮才清的残渣。
 constexpr ca::usize kMaxRounds = 4;
 
+// ==== SCAN ====================================================================
+// 识别"这段代码对程序状态没有任何贡献"的空转窗口。纯读，不改指令/异常表/常量池。
+//
+//   粗找  leadersOf 切块 + neutralWindow 试窗口   可钉形状，便宜、高召回
+//   细找  computeLiveness 活跃性判据               判据等级 **S2**（结构事实）
+//   拒绝  栈不自足 / 写下的槽在出口后仍活 / 窗口收不住 / 方法带异常表
+//
+// 拒绝面即安全面：`deltaOf` 白名单只收"确定不抛、无副作用、效应固定"的指令，
+// 有一丝不确定就整块放弃。
+//
 // ── 栈效应白名单 ──
 
 struct Delta
@@ -456,6 +466,15 @@ bool neutralWindow(jbc::ir::ClassSession& session,
     return true;
 }
 
+// ==== REWRITE =================================================================
+// 改写。原语在 cfg.hpp，本节只有 cleanup 自己的旁路。
+//
+//   bypassNeutralRuns  删窗口、留末尾 goto
+//   threadGotos / pruneUnreachable / tidyGotoToNext / foldStoreLoadPairs  全在 cfg.hpp
+//
+// 三个步骤互相解锁（删死块让 goto 相接、旁路让新死块出现），所以由 run() 循环
+// 到不动点；顺序是"删窗口 → goto 线程化 → 收不可达"，换序会让中间态过不了帧。
+//
 /// 旁路"栈自足 + 写下的槽在出口后已死 + 收在 goto 前"的窗口。
 ///
 /// 做法是**只删窗口、留下末尾的 goto**：`kRetargetToFallthrough` 会把所有跳向
@@ -532,73 +551,19 @@ ca::usize bypassNeutralRuns(jbc::ir::ClassSession& session, CodeUnit& cu)
     return victims.size();
 }
 
-// ── goto 线程化 ──
+// ==== PROOF ===================================================================
+// 判定 + 回滚。run() 本身只做编排：判据在 SCAN 段，改写原语在 REWRITE 段与
+// cfg.hpp 里，这里只负责"改完之后还能不能发"。
+//
+//   类级门  方法带异常表 → 整方法跳过（fail-closed，不做半截改写）
+//   写回    ClassSet::commit —— 帧再生 + 校验器 + 类数不增，失败回滚该类
+//   包级门  整包不发布
+//
+// 回滚粒度是**类**：一个类过不了门就整类还原。禁止"修一下让它过"。
 
-/// 把"跳到一条 goto"的边接到那条 goto 自己的目标上。
-///
-/// 块切分把一条长跳拆成 `goto A` / `A: goto B` 这样的接力，反编译器会为每一
-/// 跳造一层中转。顺着 goto 链走到头再一次性改写，比逐跳改快且不会来回震荡
-/// （`goto A` / `A: goto B` / `B: goto A` 这种环也能停在第一次重复处）。
-///
-/// switch 的 case 表不动——`setTarget` 只改默认目标，改了会让默认分支和 case
-/// 分支指向不同的中转块，形态更差；反正两边最终落到同一处，不改也不影响语义。
-ca::usize threadGotos(CodeUnit& cu)
-{
-    const auto&     order = cu.dom.order();
-    const ca::usize n     = order.size();
-    const Layout    lay   = layoutOf(cu.dom);
+// `threadGotos` 已收口进 cfg.hpp 的 REWRITE 工具箱（跨残留复用点：
+// 同一个原语要给 cleanup 与 control_flow 两边用，不许各留一份）。
 
-    struct Rewire
-    {
-        InsnId at;
-        LabelId to;
-    };
-    std::vector<Rewire> plan;
-
-    std::vector<bool> visited;
-    for (ca::usize i = 0; i < n; ++i) {
-        const Insn* in = cu.dom.peek(order[i]);
-        if (in == nullptr) continue;
-
-        const Flow f = flowOf(in->op);
-        if (f != Flow::Jump && f != Flow::Cond) continue;
-
-        ca::usize t = 0;
-        if (!indexOfLabel(cu.dom, in->target, lay, t)) continue;
-
-        visited.assign(n, false);
-        LabelId finalTarget = in->target;
-        bool    moved       = false;
-
-        for (ca::usize guard = 0; guard < n; ++guard) {
-            if (t >= n || visited[t]) break;
-            visited[t] = true;
-
-            const Insn* dst = cu.dom.peek(order[t]);
-            if (dst == nullptr) break;
-            if (dst->op != Op::GOTO && dst->op != Op::GOTO_W) break;
-
-            ca::usize t2 = 0;
-            if (!indexOfLabel(cu.dom, dst->target, lay, t2)) break;
-            if (t2 == t) break;   // 自环
-
-            finalTarget = dst->target;
-            t           = t2;
-            moved       = true;
-        }
-
-        if (moved) plan.push_back(Rewire{order[i], finalTarget});
-    }
-
-    if (plan.empty()) return 0;
-
-    jbc::ir::CodeEditor editor(cu);
-    ca::usize           done = 0;
-    for (const Rewire& r : plan) {
-        if (editor.setTarget(r.at, r.to).is_ok()) ++done;
-    }
-    return done;
-}
 
 }   // namespace
 

@@ -1,13 +1,22 @@
 /// @file        cfg.hpp
-/// @brief       各 pass 共用的字节码控制流底座：指令身份键、标签解析、流形状分类。
+/// @brief       字节码控制流的**工具箱**：指令身份键、标签解析、流形状分类、
+///              后继图与可达性（scan 侧），以及区域级改写原语（rewrite 侧）。
 ///
-/// 三个 pass（StringDecrypt / ControlFlow / Checks）都要回答同一个问题："这条
-/// 指令会把控制交给谁"。答案的唯一可靠来源是 libjbc 的 `CodeDom` + 标签解析，
-/// 不能从 `Insn` 的原始操作数读——分支偏移在 IR 里已经变成标签句柄，偏移只在
-/// lower 之后才重新成立（JVMS 6.5：偏移相对于分支指令自身的 pc）。
+/// 本文件是【复用收口点】：跨残留的共享逻辑只允许落在这里或另两个工具箱里，
+/// 不允许 `<residue>.cpp` 之间直接互相调用。检查方法见 CONVENTION.md §7.1——
+/// 数每个工具箱有几份实现，>1 份就是没收口。
 ///
-/// 这里的函数全部是**只读**的：不改指令、不改异常表。改写由各 pass 自己用
-/// `CodeEditor` 做，因为改写策略（拒绝 / 改锚 / 保布局）是每个 pass 自己的语义。
+/// 文件内按工具箱分两节，顺序不可换（rewrite 依赖 scan 的图与指令分类）：
+///
+///     ==== SCAN 工具箱 ====     纯读：不改指令、不改异常表、不改常量池
+///     ==== REWRITE 工具箱 ====  改写：一律走 `CodeEditor`
+///
+/// 改写策略（拒绝 / 改锚 / 保布局）仍然是各残留自己的语义——工具箱只提供原语，
+/// 不做决策。
+///
+/// 底座不变量：回答"这条指令会把控制交给谁"只能靠 libjbc 的 `CodeDom` + 标签
+/// 解析，不能从 `Insn` 的原始操作数读——分支偏移在 IR 里已经变成标签句柄，
+/// 偏移只在 lower 之后才重新成立（JVMS 6.5：偏移相对于分支指令自身的 pc）。
 #pragma once
 
 #include <cstdint>
@@ -116,6 +125,10 @@ inline Flow flowOf(jbc::core::Op op) noexcept
     }
 }
 
+// ==== SCAN 工具箱 =============================================================
+// 纯读。回答"这条指令会把控制交给谁"、"从哪可达"、"这个槽谁读谁写"。
+// 本节任何函数都不得改指令 / 异常表 / 常量池（CONVENTION.md §3.2 第 3 条）。
+//
 // ── 后继图 ──
 
 /// 后继表。多留一格给"方法末尾"伪节点（下标 == 指令数），这样方法末尾标签
@@ -231,6 +244,75 @@ inline void computeAlive(const Graph&                   g,
     }
 }
 
+// ── 局部变量指令分类 ──
+
+/// 局部变量指令的槽位下标（`_0.._3` 缩略形态与显式索引）。
+inline ca::i32 localSlotOf(const jbc::ir::Insn& in)
+{
+    switch (in.op) {
+    case jbc::core::Op::ILOAD_0: case jbc::core::Op::LLOAD_0: case jbc::core::Op::FLOAD_0: case jbc::core::Op::DLOAD_0: case jbc::core::Op::ALOAD_0:
+    case jbc::core::Op::ISTORE_0: case jbc::core::Op::LSTORE_0: case jbc::core::Op::FSTORE_0: case jbc::core::Op::DSTORE_0: case jbc::core::Op::ASTORE_0:
+        return 0;
+    case jbc::core::Op::ILOAD_1: case jbc::core::Op::LLOAD_1: case jbc::core::Op::FLOAD_1: case jbc::core::Op::DLOAD_1: case jbc::core::Op::ALOAD_1:
+    case jbc::core::Op::ISTORE_1: case jbc::core::Op::LSTORE_1: case jbc::core::Op::FSTORE_1: case jbc::core::Op::DSTORE_1: case jbc::core::Op::ASTORE_1:
+        return 1;
+    case jbc::core::Op::ILOAD_2: case jbc::core::Op::LLOAD_2: case jbc::core::Op::FLOAD_2: case jbc::core::Op::DLOAD_2: case jbc::core::Op::ALOAD_2:
+    case jbc::core::Op::ISTORE_2: case jbc::core::Op::LSTORE_2: case jbc::core::Op::FSTORE_2: case jbc::core::Op::DSTORE_2: case jbc::core::Op::ASTORE_2:
+        return 2;
+    case jbc::core::Op::ILOAD_3: case jbc::core::Op::LLOAD_3: case jbc::core::Op::FLOAD_3: case jbc::core::Op::DLOAD_3: case jbc::core::Op::ALOAD_3:
+    case jbc::core::Op::ISTORE_3: case jbc::core::Op::LSTORE_3: case jbc::core::Op::FSTORE_3: case jbc::core::Op::DSTORE_3: case jbc::core::Op::ASTORE_3:
+        return 3;
+    default:
+        return in.a;
+    }
+}
+
+/// 局部变量指令的**类型族**：不同族之间不构成一对。
+enum class LocalKind : ca::u8 { Int, Long, Float, Double, Ref, None };
+
+inline LocalKind localKindOf(const jbc::core::Op op)
+{
+    switch (op) {
+    case jbc::core::Op::ILOAD: case jbc::core::Op::ILOAD_0: case jbc::core::Op::ILOAD_1: case jbc::core::Op::ILOAD_2: case jbc::core::Op::ILOAD_3:
+    case jbc::core::Op::ISTORE: case jbc::core::Op::ISTORE_0: case jbc::core::Op::ISTORE_1: case jbc::core::Op::ISTORE_2: case jbc::core::Op::ISTORE_3:
+        return LocalKind::Int;
+    case jbc::core::Op::LLOAD: case jbc::core::Op::LLOAD_0: case jbc::core::Op::LLOAD_1: case jbc::core::Op::LLOAD_2: case jbc::core::Op::LLOAD_3:
+    case jbc::core::Op::LSTORE: case jbc::core::Op::LSTORE_0: case jbc::core::Op::LSTORE_1: case jbc::core::Op::LSTORE_2: case jbc::core::Op::LSTORE_3:
+        return LocalKind::Long;
+    case jbc::core::Op::FLOAD: case jbc::core::Op::FLOAD_0: case jbc::core::Op::FLOAD_1: case jbc::core::Op::FLOAD_2: case jbc::core::Op::FLOAD_3:
+    case jbc::core::Op::FSTORE: case jbc::core::Op::FSTORE_0: case jbc::core::Op::FSTORE_1: case jbc::core::Op::FSTORE_2: case jbc::core::Op::FSTORE_3:
+        return LocalKind::Float;
+    case jbc::core::Op::DLOAD: case jbc::core::Op::DLOAD_0: case jbc::core::Op::DLOAD_1: case jbc::core::Op::DLOAD_2: case jbc::core::Op::DLOAD_3:
+    case jbc::core::Op::DSTORE: case jbc::core::Op::DSTORE_0: case jbc::core::Op::DSTORE_1: case jbc::core::Op::DSTORE_2: case jbc::core::Op::DSTORE_3:
+        return LocalKind::Double;
+    case jbc::core::Op::ALOAD: case jbc::core::Op::ALOAD_0: case jbc::core::Op::ALOAD_1: case jbc::core::Op::ALOAD_2: case jbc::core::Op::ALOAD_3:
+    case jbc::core::Op::ASTORE: case jbc::core::Op::ASTORE_0: case jbc::core::Op::ASTORE_1: case jbc::core::Op::ASTORE_2: case jbc::core::Op::ASTORE_3:
+        return LocalKind::Ref;
+    default:
+        return LocalKind::None;
+    }
+}
+
+inline bool isLocalLoad(const jbc::core::Op op)
+{
+    switch (op) {
+    case jbc::core::Op::ILOAD: case jbc::core::Op::ILOAD_0: case jbc::core::Op::ILOAD_1: case jbc::core::Op::ILOAD_2: case jbc::core::Op::ILOAD_3:
+    case jbc::core::Op::LLOAD: case jbc::core::Op::LLOAD_0: case jbc::core::Op::LLOAD_1: case jbc::core::Op::LLOAD_2: case jbc::core::Op::LLOAD_3:
+    case jbc::core::Op::FLOAD: case jbc::core::Op::FLOAD_0: case jbc::core::Op::FLOAD_1: case jbc::core::Op::FLOAD_2: case jbc::core::Op::FLOAD_3:
+    case jbc::core::Op::DLOAD: case jbc::core::Op::DLOAD_0: case jbc::core::Op::DLOAD_1: case jbc::core::Op::DLOAD_2: case jbc::core::Op::DLOAD_3:
+    case jbc::core::Op::ALOAD: case jbc::core::Op::ALOAD_0: case jbc::core::Op::ALOAD_1: case jbc::core::Op::ALOAD_2: case jbc::core::Op::ALOAD_3:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// ==== REWRITE 工具箱 ============================================================
+// 改写。一律走 `CodeEditor`；本节函数只提供原语，不做策略决策——什么时候删、
+// 什么时候改锚、什么时候保布局，是调用它们的残留自己定的。
+//
+// 依赖 SCAN 工具箱（图 / 可达性 / 局部变量分类），所以本节必须排在它之后。
+//
 /// 删掉方法里**全局不可达**的指令。
 ///
 /// 控制流注入会在方法体里撒 `goto L; nop; nop; nop; athrow; L:` 这种永不执行
@@ -303,69 +385,6 @@ inline ca::usize tidyGotoToNext(jbc::ir::CodeUnit& cu)
             return removed;
         }
         ++removed;
-    }
-}
-
-// ── 局部变量指令分类 ──
-
-/// 局部变量指令的槽位下标（`_0.._3` 缩略形态与显式索引）。
-inline ca::i32 localSlotOf(const jbc::ir::Insn& in)
-{
-    switch (in.op) {
-    case jbc::core::Op::ILOAD_0: case jbc::core::Op::LLOAD_0: case jbc::core::Op::FLOAD_0: case jbc::core::Op::DLOAD_0: case jbc::core::Op::ALOAD_0:
-    case jbc::core::Op::ISTORE_0: case jbc::core::Op::LSTORE_0: case jbc::core::Op::FSTORE_0: case jbc::core::Op::DSTORE_0: case jbc::core::Op::ASTORE_0:
-        return 0;
-    case jbc::core::Op::ILOAD_1: case jbc::core::Op::LLOAD_1: case jbc::core::Op::FLOAD_1: case jbc::core::Op::DLOAD_1: case jbc::core::Op::ALOAD_1:
-    case jbc::core::Op::ISTORE_1: case jbc::core::Op::LSTORE_1: case jbc::core::Op::FSTORE_1: case jbc::core::Op::DSTORE_1: case jbc::core::Op::ASTORE_1:
-        return 1;
-    case jbc::core::Op::ILOAD_2: case jbc::core::Op::LLOAD_2: case jbc::core::Op::FLOAD_2: case jbc::core::Op::DLOAD_2: case jbc::core::Op::ALOAD_2:
-    case jbc::core::Op::ISTORE_2: case jbc::core::Op::LSTORE_2: case jbc::core::Op::FSTORE_2: case jbc::core::Op::DSTORE_2: case jbc::core::Op::ASTORE_2:
-        return 2;
-    case jbc::core::Op::ILOAD_3: case jbc::core::Op::LLOAD_3: case jbc::core::Op::FLOAD_3: case jbc::core::Op::DLOAD_3: case jbc::core::Op::ALOAD_3:
-    case jbc::core::Op::ISTORE_3: case jbc::core::Op::LSTORE_3: case jbc::core::Op::FSTORE_3: case jbc::core::Op::DSTORE_3: case jbc::core::Op::ASTORE_3:
-        return 3;
-    default:
-        return in.a;
-    }
-}
-
-/// 局部变量指令的**类型族**：不同族之间不构成一对。
-enum class LocalKind : ca::u8 { Int, Long, Float, Double, Ref, None };
-
-inline LocalKind localKindOf(const jbc::core::Op op)
-{
-    switch (op) {
-    case jbc::core::Op::ILOAD: case jbc::core::Op::ILOAD_0: case jbc::core::Op::ILOAD_1: case jbc::core::Op::ILOAD_2: case jbc::core::Op::ILOAD_3:
-    case jbc::core::Op::ISTORE: case jbc::core::Op::ISTORE_0: case jbc::core::Op::ISTORE_1: case jbc::core::Op::ISTORE_2: case jbc::core::Op::ISTORE_3:
-        return LocalKind::Int;
-    case jbc::core::Op::LLOAD: case jbc::core::Op::LLOAD_0: case jbc::core::Op::LLOAD_1: case jbc::core::Op::LLOAD_2: case jbc::core::Op::LLOAD_3:
-    case jbc::core::Op::LSTORE: case jbc::core::Op::LSTORE_0: case jbc::core::Op::LSTORE_1: case jbc::core::Op::LSTORE_2: case jbc::core::Op::LSTORE_3:
-        return LocalKind::Long;
-    case jbc::core::Op::FLOAD: case jbc::core::Op::FLOAD_0: case jbc::core::Op::FLOAD_1: case jbc::core::Op::FLOAD_2: case jbc::core::Op::FLOAD_3:
-    case jbc::core::Op::FSTORE: case jbc::core::Op::FSTORE_0: case jbc::core::Op::FSTORE_1: case jbc::core::Op::FSTORE_2: case jbc::core::Op::FSTORE_3:
-        return LocalKind::Float;
-    case jbc::core::Op::DLOAD: case jbc::core::Op::DLOAD_0: case jbc::core::Op::DLOAD_1: case jbc::core::Op::DLOAD_2: case jbc::core::Op::DLOAD_3:
-    case jbc::core::Op::DSTORE: case jbc::core::Op::DSTORE_0: case jbc::core::Op::DSTORE_1: case jbc::core::Op::DSTORE_2: case jbc::core::Op::DSTORE_3:
-        return LocalKind::Double;
-    case jbc::core::Op::ALOAD: case jbc::core::Op::ALOAD_0: case jbc::core::Op::ALOAD_1: case jbc::core::Op::ALOAD_2: case jbc::core::Op::ALOAD_3:
-    case jbc::core::Op::ASTORE: case jbc::core::Op::ASTORE_0: case jbc::core::Op::ASTORE_1: case jbc::core::Op::ASTORE_2: case jbc::core::Op::ASTORE_3:
-        return LocalKind::Ref;
-    default:
-        return LocalKind::None;
-    }
-}
-
-inline bool isLocalLoad(const jbc::core::Op op)
-{
-    switch (op) {
-    case jbc::core::Op::ILOAD: case jbc::core::Op::ILOAD_0: case jbc::core::Op::ILOAD_1: case jbc::core::Op::ILOAD_2: case jbc::core::Op::ILOAD_3:
-    case jbc::core::Op::LLOAD: case jbc::core::Op::LLOAD_0: case jbc::core::Op::LLOAD_1: case jbc::core::Op::LLOAD_2: case jbc::core::Op::LLOAD_3:
-    case jbc::core::Op::FLOAD: case jbc::core::Op::FLOAD_0: case jbc::core::Op::FLOAD_1: case jbc::core::Op::FLOAD_2: case jbc::core::Op::FLOAD_3:
-    case jbc::core::Op::DLOAD: case jbc::core::Op::DLOAD_0: case jbc::core::Op::DLOAD_1: case jbc::core::Op::DLOAD_2: case jbc::core::Op::DLOAD_3:
-    case jbc::core::Op::ALOAD: case jbc::core::Op::ALOAD_0: case jbc::core::Op::ALOAD_1: case jbc::core::Op::ALOAD_2: case jbc::core::Op::ALOAD_3:
-        return true;
-    default:
-        return false;
     }
 }
 
@@ -457,4 +476,70 @@ inline ca::usize foldStoreLoadPairs(jbc::ir::CodeUnit& cu)
     return victims.size();
 }
 
+
+/// 把"跳到一条 goto"的边接到那条 goto 自己的目标上。
+///
+/// 块切分把一条长跳拆成 `goto A` / `A: goto B` 这样的接力，反编译器会为每一
+/// 跳造一层中转。顺着 goto 链走到头再一次性改写，比逐跳改快且不会来回震荡
+/// （`goto A` / `A: goto B` / `B: goto A` 这种环也能停在第一次重复处）。
+///
+/// switch 的 case 表不动——`setTarget` 只改默认目标，改了会让默认分支和 case
+/// 分支指向不同的中转块，形态更差；反正两边最终落到同一处，不改也不影响语义。
+inline ca::usize threadGotos(jbc::ir::CodeUnit& cu)
+{
+    const auto&     order = cu.dom.order();
+    const ca::usize n     = order.size();
+    const Layout    lay   = layoutOf(cu.dom);
+
+    struct Rewire
+    {
+        jbc::ir::InsnId  at;
+        jbc::ir::LabelId to;
+    };
+    std::vector<Rewire> plan;
+
+    std::vector<bool> visited;
+    for (ca::usize i = 0; i < n; ++i) {
+        const jbc::ir::Insn* in = cu.dom.peek(order[i]);
+        if (in == nullptr) continue;
+
+        const Flow f = flowOf(in->op);
+        if (f != Flow::Jump && f != Flow::Cond) continue;
+
+        ca::usize t = 0;
+        if (!indexOfLabel(cu.dom, in->target, lay, t)) continue;
+
+        visited.assign(n, false);
+        jbc::ir::LabelId finalTarget = in->target;
+        bool             moved       = false;
+
+        for (ca::usize guard = 0; guard < n; ++guard) {
+            if (t >= n || visited[t]) break;
+            visited[t] = true;
+
+            const jbc::ir::Insn* dst = cu.dom.peek(order[t]);
+            if (dst == nullptr) break;
+            if (dst->op != jbc::core::Op::GOTO && dst->op != jbc::core::Op::GOTO_W) break;
+
+            ca::usize t2 = 0;
+            if (!indexOfLabel(cu.dom, dst->target, lay, t2)) break;
+            if (t2 == t) break;   // 自环
+
+            finalTarget = dst->target;
+            t           = t2;
+            moved       = true;
+        }
+
+        if (moved) plan.push_back(Rewire{order[i], finalTarget});
+    }
+
+    if (plan.empty()) return 0;
+
+    jbc::ir::CodeEditor editor(cu);
+    ca::usize           done = 0;
+    for (const Rewire& r : plan) {
+        if (editor.setTarget(r.at, r.to).is_ok()) ++done;
+    }
+    return done;
+}
 }  // namespace dasho
